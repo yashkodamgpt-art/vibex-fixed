@@ -1,5 +1,5 @@
 {
-  "name": "vibex experimentation",
+  "name": "vibex experimentation with claude",
   "description": "A lively and vibrant note-taking application where you can securely store your thoughts and ideas. Sign up to start capturing your vibes and access them anytime.",
   "requestFramePermissions": [
     "geolocation"

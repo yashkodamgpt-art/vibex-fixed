@@ -37,39 +37,19 @@ const MainApp: React.FC<MainAppProps> = ({ user, onLogout, onProfileUpdate }) =>
   const [error, setError] = useState<string | null>(null);
   const [isProfileQuickViewOpen, setIsProfileQuickViewOpen] = useState(false);
   const mapViewRef = useRef<MapViewRef>(null);
+  const [sessionValid, setSessionValid] = useState(true);
 
-  // Session Heartbeat Check: This crucial effect validates the user's session on every load
-  // to prevent "zombie sessions". If Supabase reports the session is invalid or
-  // mismatched, it triggers a forced logout and reset.
+  // REMOVED: Redundant session heartbeat - App.tsx already handles this
+  // MainApp only renders when session is valid, so we start with sessionValid = true
   useEffect(() => {
-    const checkSessionHeartbeat = async () => {
-      console.log('🩺 Checking session heartbeat...');
-      
-      // This is a lightweight, authenticated request to check session validity
-      const { data: { user: authUser }, error } = await supabase.auth.getUser();
+    console.log('🎯 MainApp mounted for user:', user.profile.username);
+    // No need to check session here - App.tsx already validated it
+  }, [user]);
 
-      if (error || !authUser) {
-        // ZOMBIE SESSION DETECTED
-        // The React state thinks a user is logged in, but Supabase auth is broken.
-        console.error('💔 Session heartbeat failed! Forcing hard logout.', error);
-        alert("Your session was invalid. Forcing a refresh. Please log in again.");
-        onLogout(); // This will trigger the hard reset
-      } else if (authUser.id !== user.id) {
-        // MISMATCH DETECTED
-        // React state is for User A, but Supabase auth is for User B.
-        console.error('U_U Session mismatch! Forcing hard logout.');
-        alert("User account mismatch. Forcing a refresh. Please log in again.");
-        onLogout(); // This will trigger the hard reset
-      } else {
-        // Session is valid.
-        console.log('✅ Session heartbeat OK.');
-      }
-    };
-
-    checkSessionHeartbeat();
-  }, [user, onLogout]);
-
+  // Fetch events with better error handling
   useEffect(() => {
+    if (!sessionValid) return;
+    
     const fetchEvents = async () => {
         try {
             const { data, error: fetchError } = await supabase
@@ -79,7 +59,14 @@ const MainApp: React.FC<MainAppProps> = ({ user, onLogout, onProfileUpdate }) =>
             
             if (fetchError) {
                 console.error("Error fetching events", fetchError);
-                setError("Failed to load events. Please refresh the page.");
+                
+                // Check if it's an auth error
+                if (fetchError.message.includes('JWT') || fetchError.message.includes('session')) {
+                  setError("Session expired. Please log in again.");
+                  setTimeout(() => onLogout(), 2000);
+                } else {
+                  setError("Failed to load events. Please refresh the page.");
+                }
             } else {
                 setEvents(data as Event[]);
                 setError(null);
@@ -94,54 +81,82 @@ const MainApp: React.FC<MainAppProps> = ({ user, onLogout, onProfileUpdate }) =>
     const eventsSubscription = supabase.channel('public:events')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'events' }, payload => {
         console.log('Change received!', payload)
-        fetchEvents(); // Refetch all events on any change
+        fetchEvents();
       })
       .subscribe();
       
     return () => {
         supabase.removeChannel(eventsSubscription);
     };
-  }, []);
+  }, [sessionValid, onLogout]);
   
   useEffect(() => {
+    if (!sessionValid) return;
+    
     let messagesSubscription: any = null;
     if (isChatVisible && activeVibe) {
         const fetchMessages = async () => {
-            const { data, error } = await supabase
-                .from('messages')
-                .select('*, sender:profiles(username)')
-                .eq('event_id', activeVibe.id)
-                .order('created_at');
-            if (error) console.error("Error fetching messages", error);
-            else setChatMessages(data as any[] as VibeMessage[]);
+            try {
+                const { data, error } = await supabase
+                    .from('messages')
+                    .select('*, sender:profiles(username)')
+                    .eq('event_id', activeVibe.id)
+                    .order('created_at');
+                    
+                if (error) {
+                    console.error("Error fetching messages", error);
+                    if (error.message.includes('JWT') || error.message.includes('session')) {
+                      setError("Session expired. Please log in again.");
+                      setTimeout(() => onLogout(), 2000);
+                    }
+                } else {
+                    setChatMessages(data as any[] as VibeMessage[]);
+                }
+            } catch (err) {
+                console.error("Unexpected error fetching messages:", err);
+            }
         };
         fetchMessages();
 
         messagesSubscription = supabase.channel(`public:messages:event_id=eq.${activeVibe.id}`)
-            .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages', filter: `event_id=eq.${activeVibe.id}` }, 
+            .on('postgres_changes', { 
+                event: 'INSERT', 
+                schema: 'public', 
+                table: 'messages', 
+                filter: `event_id=eq.${activeVibe.id}` 
+            }, 
             async (payload) => {
                 try {
-                    const { data: profile, error } = await supabase.from('profiles').select('username').eq('id', payload.new.sender_id).single();
+                    const { data: profile, error } = await supabase
+                        .from('profiles')
+                        .select('username')
+                        .eq('id', payload.new.sender_id)
+                        .single();
+                        
                     if (error) {
                         console.error(error);
-                        setChatMessages(msgs => [...msgs, { ...payload.new, sender: { username: 'Unknown' } } as VibeMessage]);
+                        setChatMessages(msgs => [...msgs, { 
+                            ...payload.new, 
+                            sender: { username: 'Unknown' } 
+                        } as VibeMessage]);
                     } else {
-                        setChatMessages(msgs => [...msgs, { ...payload.new, sender: { username: profile.username } } as VibeMessage]);
+                        setChatMessages(msgs => [...msgs, { 
+                            ...payload.new, 
+                            sender: { username: profile.username } 
+                        } as VibeMessage]);
                     }
                 } catch (err) {
                     console.error('Error handling new message:', err);
                 }
             })
             .subscribe();
-
     }
     return () => {
         if(messagesSubscription) {
             supabase.removeChannel(messagesSubscription);
         }
     };
-  }, [isChatVisible, activeVibe]);
-
+  }, [isChatVisible, activeVibe, sessionValid, onLogout]);
 
   const handleMapClickInCreateMode = (coords: { lat: number; lng: number }) => {
     if (activeVibe) {
@@ -154,28 +169,40 @@ const MainApp: React.FC<MainAppProps> = ({ user, onLogout, onProfileUpdate }) =>
   };
 
   const handleCreateEvent = async (eventData: Omit<Event, 'id' | 'creator' | 'creator_id' | 'lat' | 'lng' | 'participants'>) => {
-    if (!newEventCoords) return;
+    if (!newEventCoords || !sessionValid) return;
 
-    const { data: newEvent, error } = await supabase
-        .from('events')
-        .insert({
-            ...eventData,
-            status: 'active',
-            lat: newEventCoords.lat,
-            lng: newEventCoords.lng,
-            creator_id: user.id,
-            participants: [user.id],
-        })
-        .select('*, creator:profiles(username)')
-        .single();
-    
-    if (error) {
-        console.error("Error creating event:", error);
-    } else if (newEvent) {
-        setActiveVibe(newEvent as Event);
-        setIsCreateModalOpen(false);
-        setNewEventCoords(null);
-        setIsCreateMode(false);
+    try {
+        const { data: newEvent, error } = await supabase
+            .from('events')
+            .insert({
+                ...eventData,
+                status: 'active',
+                lat: newEventCoords.lat,
+                lng: newEventCoords.lng,
+                creator_id: user.id,
+                participants: [user.id],
+            })
+            .select('*, creator:profiles(username)')
+            .single();
+        
+        if (error) {
+            console.error("Error creating event:", error);
+            if (error.message.includes('JWT') || error.message.includes('session')) {
+              setError("Session expired. Please log in again.");
+              setTimeout(() => onLogout(), 2000);
+            } else {
+              setError("Failed to create event. Please try again.");
+            }
+        } else if (newEvent) {
+            setActiveVibe(newEvent as Event);
+            setIsCreateModalOpen(false);
+            setNewEventCoords(null);
+            setIsCreateMode(false);
+            setError(null);
+        }
+    } catch (err) {
+        console.error("Unexpected error creating event:", err);
+        setError("Failed to create event. Please try again.");
     }
   };
   
@@ -184,20 +211,58 @@ const MainApp: React.FC<MainAppProps> = ({ user, onLogout, onProfileUpdate }) =>
   };
 
   const handleCloseEvent = async (eventId: number) => {
-    await supabase.from('events').update({ status: 'closed' }).eq('id', eventId);
-    if (activeVibe?.id === eventId) {
-      setActiveVibe(null);
-      setIsChatVisible(false);
+    if (!sessionValid) return;
+    
+    try {
+        const { error } = await supabase
+            .from('events')
+            .update({ status: 'closed' })
+            .eq('id', eventId);
+            
+        if (error) {
+            console.error("Error closing event:", error);
+            if (error.message.includes('JWT') || error.message.includes('session')) {
+              setError("Session expired. Please log in again.");
+              setTimeout(() => onLogout(), 2000);
+            }
+        } else {
+            if (activeVibe?.id === eventId) {
+              setActiveVibe(null);
+              setIsChatVisible(false);
+            }
+        }
+    } catch (err) {
+        console.error("Unexpected error closing event:", err);
     }
   };
 
   const handleExtendEvent = async (eventId: number) => {
+      if (!sessionValid) return;
+      
       const event = events.find(e => e.id === eventId);
       if (!event) return;
-      await supabase.from('events').update({ duration: event.duration + 15 }).eq('id', eventId);
+      
+      try {
+          const { error } = await supabase
+              .from('events')
+              .update({ duration: event.duration + 15 })
+              .eq('id', eventId);
+              
+          if (error) {
+              console.error("Error extending event:", error);
+              if (error.message.includes('JWT') || error.message.includes('session')) {
+                setError("Session expired. Please log in again.");
+                setTimeout(() => onLogout(), 2000);
+              }
+          }
+      } catch (err) {
+          console.error("Unexpected error extending event:", err);
+      }
   };
 
   const handleJoinVibe = async (eventId: number) => {
+    if (!sessionValid) return;
+    
     if (activeVibe) {
         alert("You're already in a Vibe. Please leave it before joining another.");
         return;
@@ -205,58 +270,127 @@ const MainApp: React.FC<MainAppProps> = ({ user, onLogout, onProfileUpdate }) =>
     const event = events.find(e => e.id === eventId);
     if (!event) return;
 
-    const newParticipants = [...event.participants, user.id];
-    const { data, error } = await supabase
-        .from('events')
-        .update({ participants: newParticipants })
-        .eq('id', eventId)
-        .select('*, creator:profiles(username)')
-        .single();
-        
-    if (error) console.error("Error joining vibe:", error);
-    else setActiveVibe(data as Event);
+    try {
+        const newParticipants = [...event.participants, user.id];
+        const { data, error } = await supabase
+            .from('events')
+            .update({ participants: newParticipants })
+            .eq('id', eventId)
+            .select('*, creator:profiles(username)')
+            .single();
+            
+        if (error) {
+            console.error("Error joining vibe:", error);
+            if (error.message.includes('JWT') || error.message.includes('session')) {
+              setError("Session expired. Please log in again.");
+              setTimeout(() => onLogout(), 2000);
+            }
+        } else {
+            setActiveVibe(data as Event);
+        }
+    } catch (err) {
+        console.error("Unexpected error joining vibe:", err);
+    }
   };
 
   const handleLeaveVibe = async (eventId: number) => {
+      if (!sessionValid) return;
+      
       const event = events.find(e => e.id === eventId);
       if (!event) return;
 
-      const newParticipants = event.participants.filter(p => p !== user.id);
-      await supabase.from('events').update({ participants: newParticipants }).eq('id', eventId);
-      
-      setActiveVibe(null);
-      setIsChatVisible(false);
+      try {
+          const newParticipants = event.participants.filter(p => p !== user.id);
+          const { error } = await supabase
+              .from('events')
+              .update({ participants: newParticipants })
+              .eq('id', eventId);
+              
+          if (error) {
+              console.error("Error leaving vibe:", error);
+              if (error.message.includes('JWT') || error.message.includes('session')) {
+                setError("Session expired. Please log in again.");
+                setTimeout(() => onLogout(), 2000);
+              }
+          } else {
+              setActiveVibe(null);
+              setIsChatVisible(false);
+          }
+      } catch (err) {
+          console.error("Unexpected error leaving vibe:", err);
+      }
   };
 
   const handleSendMessage = async (text: string) => {
-      if (!activeVibe) return;
+      if (!activeVibe || !sessionValid) return;
 
-      await supabase.from('messages').insert({
-          text,
-          sender_id: user.id,
-          event_id: activeVibe.id,
-      });
+      try {
+          const { error } = await supabase
+              .from('messages')
+              .insert({
+                  text,
+                  sender_id: user.id,
+                  event_id: activeVibe.id,
+              });
+              
+          if (error) {
+              console.error("Error sending message:", error);
+              if (error.message.includes('JWT') || error.message.includes('session')) {
+                setError("Session expired. Please log in again.");
+                setTimeout(() => onLogout(), 2000);
+              }
+          }
+      } catch (err) {
+          console.error("Unexpected error sending message:", err);
+      }
   };
 
   const handleOpenProfile = async (username: string) => {
-      const { data: profile, error } = await supabase.from('profiles').select('*').eq('username', username).single();
-      if(error) {
-           console.error("Could not find user to view profile for:", username, error);
-           return;
-      }
-      if (profile) {
-          const userToView: User = {
-              id: profile.id,
-              profile: {
-                username: profile.username,
-                bio: profile.bio,
-                privacy: profile.privacy,
-              }
-          };
-          setViewedUser(userToView);
-          setIsProfileModalOpen(true);
+      if (!sessionValid) return;
+      
+      try {
+          const { data: profile, error } = await supabase
+              .from('profiles')
+              .select('*')
+              .eq('username', username)
+              .single();
+              
+          if(error) {
+               console.error("Could not find user to view profile for:", username, error);
+               if (error.message.includes('JWT') || error.message.includes('session')) {
+                 setError("Session expired. Please log in again.");
+                 setTimeout(() => onLogout(), 2000);
+               }
+               return;
+          }
+          if (profile) {
+              const userToView: User = {
+                  id: profile.id,
+                  profile: {
+                    username: profile.username,
+                    bio: profile.bio,
+                    privacy: profile.privacy,
+                  }
+              };
+              setViewedUser(userToView);
+              setIsProfileModalOpen(true);
+          }
+      } catch (err) {
+          console.error("Unexpected error opening profile:", err);
       }
   };
+
+  if (!sessionValid) {
+    return (
+      <div className="flex items-center justify-center min-h-screen bg-green-50">
+        <div className="text-center p-4">
+          <div className="text-red-500 text-5xl mb-4">⚠️</div>
+          <p className="text-gray-800 text-lg mb-4">Session validation failed...</p>
+          <p className="text-gray-600">Redirecting to login...</p>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="h-screen w-screen overflow-hidden bg-green-50 flex flex-col">
@@ -270,24 +404,18 @@ const MainApp: React.FC<MainAppProps> = ({ user, onLogout, onProfileUpdate }) =>
         {error && (
             <div className="fixed top-20 left-1/2 -translate-x-1/2 z-[2000] bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded shadow-lg max-w-md w-11/12" role="alert">
                 <div className="flex justify-between items-center">
-                    <div>
+                    <div className="flex-grow">
                         <strong className="font-bold">Error:</strong>
                         <span className="block sm:inline ml-2">{error}</span>
                     </div>
-                    <button onClick={async () => {
-                        console.log('Error Refresh: Signing out and clearing all storage...');
-                        alert("Performing an emergency session reset. The app will reload.");
-                        try {
-                            await supabase.auth.signOut();
-                        } catch (e) {
-                            console.error('Sign out failed, proceeding with storage clear.', e);
-                        }
-                        localStorage.clear();
-                        sessionStorage.clear();
-                        console.log('Storage cleared. Reloading window.');
-                        window.location.reload();
-                    }} className="text-xs bg-yellow-200 text-yellow-800 font-semibold px-2 py-1 rounded hover:bg-yellow-300 transition-colors flex-shrink-0 ml-4">
-                        Force Refresh
+                    <button 
+                        onClick={() => setError(null)} 
+                        className="text-red-700 hover:text-red-900 ml-4 flex-shrink-0"
+                        aria-label="Dismiss error"
+                    >
+                        <svg className="h-5 w-5" fill="currentColor" viewBox="0 0 20 20">
+                          <path fillRule="evenodd" d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z" clipRule="evenodd" />
+                        </svg>
                     </button>
                 </div>
             </div>

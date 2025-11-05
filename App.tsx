@@ -1,4 +1,3 @@
-
 import React, { useState, useEffect, useCallback } from 'react';
 import type { User } from './types';
 import Login from './components/auth/Login';
@@ -12,7 +11,6 @@ const App: React.FC = () => {
   const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [authView, setAuthView] = useState<AuthView>('login');
   const [loading, setLoading] = useState(true);
-  const [isStuck, setIsStuck] = useState(false);
 
   const loadUserProfile = useCallback(async (authUser: any) => {
     if (authUser.aud !== 'authenticated') {
@@ -81,14 +79,24 @@ const App: React.FC = () => {
   useEffect(() => {
     setLoading(true);
 
-    const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, session) => {
-      console.log(`🔔 Auth state changed: ${event}`);
+    // First, explicitly check for the current session. This is more reliable on initial load.
+    supabase.auth.getSession().then(async ({ data: { session } }) => {
       if (session?.user) {
         await loadUserProfile(session.user);
       } else {
         setCurrentUser(null);
       }
-      setLoading(false);
+      setLoading(false); // We are done with the initial load.
+    });
+
+    // Then, set up a listener for any future auth changes.
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(async (_event, session) => {
+      console.log(`🔔 Auth state changed: ${_event}`);
+      if (session?.user) {
+        await loadUserProfile(session.user);
+      } else {
+        setCurrentUser(null);
+      }
     });
 
     return () => {
@@ -164,17 +172,21 @@ const App: React.FC = () => {
   };
   
   useEffect(() => {
-    let timer: ReturnType<typeof setTimeout> | null = null;
+    // If the app is stuck in the loading state for too long, it might be a caching issue
+    // or a problem with the Supabase session. This acts as a safety net to prevent
+    // the user from being stuck on a loading screen indefinitely.
     if (loading) {
-        timer = setTimeout(() => {
-            setIsStuck(true);
-        }, 5000); // 5 seconds
-    } else {
-        setIsStuck(false);
+        const timeoutId = setTimeout(() => {
+            console.warn("App is taking too long to initialize (>10s). Forcing a hard refresh and clearing storage.");
+            alert("Application is taking a while to load. We'll perform a quick refresh to resolve any potential issues.");
+            localStorage.clear();
+            sessionStorage.clear();
+            window.location.reload();
+        }, 10000); // 10 seconds
+
+        // If loading completes before the timeout, this cleanup function will clear it.
+        return () => clearTimeout(timeoutId);
     }
-    return () => {
-        if (timer) clearTimeout(timer);
-    };
   }, [loading]);
 
   if (loading) {
@@ -183,31 +195,6 @@ const App: React.FC = () => {
         <div className="text-center p-4">
           <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-green-600 mx-auto mb-4"></div>
           <p className="text-gray-600">Initializing...</p>
-          {isStuck && (
-              <div className="mt-6 p-4 bg-yellow-100 border border-yellow-300 rounded-lg">
-                  <p className="text-sm text-yellow-800 font-semibold mb-3">Something seems to be stuck.</p>
-                  <div className="flex justify-center space-x-2">
-                      <button
-                          onClick={async () => {
-                              console.log('Force Reload: Signing out and clearing all storage...');
-                              try {
-                                  // Try to sign out, but don't stop if it fails
-                                  await supabase.auth.signOut();
-                              } catch (e) {
-                                  console.error('Sign out failed, proceeding with storage clear.', e);
-                              }
-                              localStorage.clear(); // Brutally clear storage
-                              sessionStorage.clear(); // Brutally clear storage
-                              console.log('Storage cleared. Reloading window.');
-                              window.location.reload();
-                          }}
-                          className="px-4 py-2 bg-red-500 text-white font-semibold rounded-lg hover:bg-red-600 focus:outline-none focus:ring-2 focus:ring-red-700 focus:ring-offset-2 transition-colors text-sm"
-                      >
-                          Force Reload
-                      </button>
-                  </div>
-              </div>
-          )}
         </div>
       </div>
     );
